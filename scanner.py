@@ -68,10 +68,9 @@ def _extract_event(raw: dict) -> dict:
     }
 
 def scan_file(file_path: str) -> tuple:
-    """Scan a file using clamd and return (status, output)."""
     try:
         result = subprocess.run(
-            ["clamdscan", "--fdpass", "--stream", "--no-summary", file_path],
+            ["clamdscan", "--host=localhost", "--port=3310", "--stream", "--no-summary", file_path],
             capture_output=True,
             text=True,
             timeout=240
@@ -201,13 +200,21 @@ def process_event(raw_evt: dict):
 def health():
     """Health check endpoint"""
     try:
-        # Verify ClamAV is reachable
-        subprocess.run(["clamdscan", "--ping"], check=True, timeout=5)
+        # Verify ClamAV is reachable via TCP
+        subprocess.run(
+            ["clamdscan", "--host=localhost", "--port=3310", "--ping"],
+            check=True,
+            timeout=5,
+            capture_output=True
+        )
         return "OK", 200
+    except subprocess.TimeoutExpired:
+        logger.error("Health check timeout")
+        return "Service Unavailable", 503
     except Exception as e:
         logger.error("Health check failed: %s", str(e))
         return "Service Unavailable", 503
-    
+
 @app.route("/", methods=["POST"])
 def index():
     """Handle HTTP requests from Pub/Sub."""
