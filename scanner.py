@@ -149,20 +149,29 @@ def process_event(raw_evt: dict):
         return
 
     bucket_name = evt["bucket"]
-    obj_name = evt["name"]
+    obj_name    = evt["name"]
+
+    # Fetch authoritative metadata from GCS
+    src_bucket          = storage_client.bucket(bucket_name)
+    src_blob            = src_bucket.blob(obj_name)
+    src_blob.reload()
+    actual_size         = src_blob.size or 0
+    actual_contentType  = src_blob.content_type or "<none>"
+
     logger.info(
         "Processing file: gs://%s/%s (%s, %d bytes)",
-        bucket_name, obj_name, evt["contentType"], evt["size"]
+        bucket_name, obj_name, actual_contentType, actual_size
     )
 
     status = "QUARANTINED"  # Default to quarantine
 
     # Only scan supported file types under 50MB
-    if evt["contentType"] in ("image/png", "image/jpeg", "application/pdf") and evt["size"] <= 50_000_000:
+    if actual_contentType in ("image/png", "image/jpeg", "application/pdf") \
+            and actual_size <= 50_000_000:
         try:
             with tempfile.NamedTemporaryFile() as tmp_file:
                 # Download file to temporary location
-                storage_client.bucket(bucket_name).blob(obj_name).download_to_filename(tmp_file.name)
+                src_blob.download_to_filename(tmp_file.name)
                 logger.debug("Downloaded file to temporary location: %s", tmp_file.name)
 
                 # Scan the file
@@ -181,7 +190,7 @@ def process_event(raw_evt: dict):
     else:
         logger.info(
             "Auto-quarantining due to file type/size: %s (%d bytes)",
-            evt["contentType"], evt["size"]
+            actual_contentType, actual_size
         )
 
     # Move file and publish result
