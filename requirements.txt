@@ -1,3 +1,5 @@
 google-cloud-storage
 google-cloud-pubsub
 python-magic
+Flask
+gunicorn

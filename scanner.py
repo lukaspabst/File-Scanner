@@ -197,6 +197,17 @@ def process_event(raw_evt: dict):
     if move_file(bucket_name, obj_name, status):
         publish_result(obj_name, status)
 
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    try:
+        # Verify ClamAV is reachable
+        subprocess.run(["clamdscan", "--ping"], check=True, timeout=5)
+        return "OK", 200
+    except Exception as e:
+        logger.error("Health check failed: %s", str(e))
+        return "Service Unavailable", 503
+    
 @app.route("/", methods=["POST"])
 def index():
     """Handle HTTP requests from Pub/Sub."""
