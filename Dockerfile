@@ -2,7 +2,7 @@
 
 FROM python:3.11-slim
 
-# 1) Install system deps: ClamAV, Supervisor, netcat-openbsd, curl; add appuser; patch clamd.conf
+# 1) Install ClamAV, Supervisor, netcat-openbsd, curl; add appuser; patch clamd.conf
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       clamav clamav-daemon supervisor netcat-openbsd curl && \
@@ -21,7 +21,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir gunicorn
 
-# 3) Copy application code & configs, set permissions
+# 3) Copy code & configs, set permissions
 COPY scanner.py supervisord.conf entrypoint.sh ./
 RUN chmod +x entrypoint.sh && \
     chown -R appuser:appuser /app
