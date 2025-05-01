@@ -1,21 +1,21 @@
-# Start from a slim Debian that supports ClamAV
-FROM debian:bookworm-slim
+# Dockerfile
 
-# Install ClamAV + Python
+FROM python:3.11-slim
+
+# Install ClamAV + daemon, Supervisor
 RUN apt-get update && \
-    apt-get install -y clamav clamav-daemon python3 python3-pip && \
+    apt-get install -y --no-install-recommends \
+      clamav clamav-daemon supervisor && \
     freshclam && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy your Python code
 WORKDIR /app
+
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
-COPY scanner.py .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Use a non-root user for extra safety (optional)
-RUN useradd --create-home scanner
-USER scanner
+COPY scanner.py supervisord.conf entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-# Entry point for Cloud Run (Pub/Sub push will POST JSON here)
-CMD ["python3", "scanner.py"]
+# Run both clamd and your app under supervisor
+ENTRYPOINT ["./entrypoint.sh"]
