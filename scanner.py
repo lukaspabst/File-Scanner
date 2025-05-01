@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import logging
 import base64
+import datetime
 from urllib.parse import unquote
 
 from flask import Flask, request, abort
@@ -12,26 +13,27 @@ from google.cloud import storage, pubsub_v1
 
 # === Configuration ===
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-RESULTS_TOPIC = os.getenv("RESULTS_TOPIC", "scan-results-topic")
-PRODUCTION = os.getenv("PRODUCTION_BUCKET", "fleet-ivy-432307-m0-scanned")
+RESULTS_TOPIC = os.getenv("RESULTS_TOPIC", "file-scan-results")
+PRODUCTION = os.getenv("PRODUCTION_BUCKET", "fleet-ivy-432307-m0-production")
 QUARANTINE = os.getenv("QUARANTINE_BUCKET", "fleet-ivy-432307-m0-quarantine")
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 
-logging.basicConfig(level=LOG_LEVEL)
+# Initialize logging
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
+)
 logger = logging.getLogger("file-scanner")
 
+# Initialize clients
 storage_client = storage.Client()
 publisher = pubsub_v1.PublisherClient()
 
 app = Flask(__name__)
 
 def _extract_event(raw: dict) -> dict:
-    """
-    Normalize incoming Pub/Sub pull or push into a dict with:
-      bucket, name, contentType, size, resourceState
-    Handles both Cloud Storage v1 and v2 notification formats
-    """
-    # Handle direct Cloud Storage notification format (v2)
+    """Normalize incoming Pub/Sub message into a consistent format."""
+    # Handle direct Cloud Storage notification
     if 'bucket' in raw and 'name' in raw:
         return {
             "bucket": raw["bucket"],
@@ -45,7 +47,7 @@ def _extract_event(raw: dict) -> dict:
     msg = raw.get("message", {}) or {}
     attrs = msg.get("attributes", {}) or {}
 
-    # Try to decode data payload (base64 encoded in Pub/Sub)
+    # Decode data payload (handles both base64 and plain JSON)
     data = {}
     if "data" in msg:
         try:
@@ -57,7 +59,6 @@ def _extract_event(raw: dict) -> dict:
             except:
                 pass
 
-    # Merge attributes and data with priority to attributes
     return {
         "bucket": attrs.get("bucketId") or data.get("bucket"),
         "name": unquote(attrs.get("objectId", "") or data.get("name", "")),
@@ -66,91 +67,142 @@ def _extract_event(raw: dict) -> dict:
         "resourceState": "not_exists" if attrs.get("eventType") == "OBJECT_DELETE" else "exists",
     }
 
-def process_event(raw_evt: dict):
-    logger.debug("Raw event data: %s", json.dumps(raw_evt, indent=2))
-    evt = _extract_event(raw_evt)
+def scan_file(file_path: str) -> tuple:
+    """Scan a file using clamd and return (status, output)."""
+    try:
+        result = subprocess.run(
+            ["clamdscan", "--fdpass", "--stream", "--no-summary", file_path],
+            capture_output=True,
+            text=True,
+            timeout=240
+        )
 
-    # Skip deletes or pre-delete notifications
-    if evt.get("resourceState") != "exists":
-        logger.info("Skipping non-existence event for %s", evt.get("name"))
-        return
+        if result.returncode == 0:
+            return ("SCANNED_OK", result.stdout.strip())
+        elif result.returncode == 1:
+            return ("INFECTED", result.stdout.strip())
+        else:
+            return ("SCAN_ERROR", result.stderr.strip())
 
-    bucket_name = evt["bucket"]
-    obj_name = evt["name"]
-    logger.info(">>> Finalized Event: gs://%s/%s", bucket_name, obj_name)
+    except subprocess.TimeoutExpired:
+        return ("TIMEOUT", "Scan timed out after 240 seconds")
+    except Exception as e:
+        return ("ERROR", str(e))
 
-    status = "QUARANTINED"
-
-    # Only scan small images & PDFs
-    if evt["contentType"] in ("image/png", "image/jpeg", "application/pdf") and evt["size"] <= 50_000_000:
-        fd, tmp = tempfile.mkstemp()
-        os.close(fd)
-        try:
-            storage_client.bucket(bucket_name).blob(obj_name).download_to_filename(tmp)
-            res = subprocess.run(
-                ["clamscan", "--stdout", tmp],
-                capture_output=True,
-                text=True,
-                timeout=240
-            )
-            status = "SCANNED_OK" if res.returncode == 0 else "QUARANTINED"
-            logger.info("ClamAV scan returned %d: %s", res.returncode, res.stdout.strip())
-        except Exception as e:
-            logger.error("Error during scan of %s: %s", obj_name, e)
-            status = "QUARANTINED"
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-    else:
-        logger.info("Auto-quarantine (%s, %d bytes)", evt["contentType"], evt["size"])
-
-    # Move object into target bucket
+def move_file(src_bucket_name: str, obj_name: str, status: str) -> bool:
+    """Move file to appropriate bucket based on scan status."""
     dst_bucket_name = PRODUCTION if status == "SCANNED_OK" else QUARANTINE
-    src_bucket = storage_client.bucket(bucket_name)
-    dst_bucket = storage_client.bucket(dst_bucket_name)
-    src_blob = src_bucket.blob(obj_name)
 
     try:
-        logger.info("Copying gs://%s/%s → gs://%s/%s", bucket_name, obj_name, dst_bucket_name, obj_name)
+        src_bucket = storage_client.bucket(src_bucket_name)
+        dst_bucket = storage_client.bucket(dst_bucket_name)
+        src_blob = src_bucket.blob(obj_name)
+
+        logger.info(
+            "Moving file: gs://%s/%s → gs://%s/%s (Status: %s)",
+            src_bucket_name, obj_name, dst_bucket_name, obj_name, status
+        )
+
+        # Perform the copy and delete operations
         dst_bucket.copy_blob(src_blob, dst_bucket, obj_name)
         src_blob.delete()
-        logger.info("Move succeeded, status=%s", status)
-    except Exception as e:
-        logger.error("Failed to move %s from %s to %s: %s", obj_name, bucket_name, dst_bucket_name, e)
 
-    # Publish the result
+        logger.info("File move completed successfully")
+        return True
+
+    except Exception as e:
+        logger.error("Failed to move file: %s", str(e))
+        return False
+
+def publish_result(obj_name: str, status: str) -> bool:
+    """Publish scan result to Pub/Sub."""
     try:
         if not PROJECT_ID:
             raise ValueError("GOOGLE_CLOUD_PROJECT environment variable not set")
 
-        topic_path = f"projects/{PROJECT_ID}/topics/{RESULTS_TOPIC}"
-        publisher.publish(
+        topic_path = publisher.topic_path(PROJECT_ID, RESULTS_TOPIC)
+
+        future = publisher.publish(
             topic_path,
-            b"",
+            data=b"",
             fileId=obj_name.split("/")[-1],
             status=status,
+            scannedAt=datetime.datetime.utcnow().isoformat(),
+            bucket=PRODUCTION if status == "SCANNED_OK" else QUARANTINE
         )
+
+        future.result()  # Wait for publish to complete
         logger.info("Published scan result for %s: %s", obj_name, status)
+        return True
+
     except Exception as e:
-        logger.error("Failed to publish scan result: %s", e)
+        logger.error("Failed to publish scan result: %s", str(e))
+        return False
+
+def process_event(raw_evt: dict):
+    """Process a file upload event."""
+    evt = _extract_event(raw_evt)
+
+    # Skip deleted objects
+    if evt.get("resourceState") != "exists":
+        logger.info("Skipping non-existent file: %s", evt.get("name"))
+        return
+
+    bucket_name = evt["bucket"]
+    obj_name = evt["name"]
+    logger.info(
+        "Processing file: gs://%s/%s (%s, %d bytes)",
+        bucket_name, obj_name, evt["contentType"], evt["size"]
+    )
+
+    status = "QUARANTINED"  # Default to quarantine
+
+    # Only scan supported file types under 50MB
+    if evt["contentType"] in ("image/png", "image/jpeg", "application/pdf") and evt["size"] <= 50_000_000:
+        try:
+            with tempfile.NamedTemporaryFile() as tmp_file:
+                # Download file to temporary location
+                storage_client.bucket(bucket_name).blob(obj_name).download_to_filename(tmp_file.name)
+                logger.debug("Downloaded file to temporary location: %s", tmp_file.name)
+
+                # Scan the file
+                scan_status, scan_output = scan_file(tmp_file.name)
+                logger.debug("Scan result: %s - %s", scan_status, scan_output)
+
+                if scan_status == "SCANNED_OK":
+                    status = "SCANNED_OK"
+                elif scan_status == "INFECTED":
+                    logger.warning("Virus detected in %s: %s", obj_name, scan_output)
+                else:
+                    logger.error("Scan failed for %s: %s", obj_name, scan_output)
+
+        except Exception as e:
+            logger.error("Error processing %s: %s", obj_name, str(e))
+    else:
+        logger.info(
+            "Auto-quarantining due to file type/size: %s (%d bytes)",
+            evt["contentType"], evt["size"]
+        )
+
+    # Move file and publish result
+    if move_file(bucket_name, obj_name, status):
+        publish_result(obj_name, status)
 
 @app.route("/", methods=["POST"])
 def index():
+    """Handle HTTP requests from Pub/Sub."""
     envelope = request.get_json(silent=True)
     if not envelope:
-        logger.error("No JSON payload")
+        logger.error("No JSON payload received")
         abort(400)
 
-    # Pub/Sub push wrapper?
-    if "message" in envelope:
+    # Process different message formats
+    if "message" in envelope:  # Pub/Sub push
         process_event(envelope)
-    # Direct JSON payload?
-    elif isinstance(envelope, dict):
-        process_event(envelope)
+    elif isinstance(envelope, dict):  # Direct JSON
+        process_event({"message": {"data": json.dumps(envelope)}})
     else:
-        logger.error("Unrecognized payload: %s", envelope)
+        logger.error("Unrecognized payload format")
         abort(400)
 
     return "", 204
